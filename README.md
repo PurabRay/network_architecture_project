@@ -30,6 +30,8 @@ Both programs are plain Python 3.8+ and use only the standard library, so there 
 
 On Windows, use `python` in place of `./`: `python bserve ./www 9000`, `python bcurl -v localhost:9000/index.html`.
 
+If `./bserve` says `permission denied`, run `chmod +x bserve bcurl` once, or start them with Python: `python3 bserve ./www 9000`.
+
 `bcurl` exit status: `0` all responses OK, `1` some response was 4xx/5xx, `2` usage or network error.
 
 ## Test it
@@ -37,6 +39,8 @@ On Windows, use `python` in place of `./`: `python bserve ./www 9000`, `python b
 ```bash
 python3 -m unittest -v tests/test_bh1.py
 ```
+
+On Windows: `python -m unittest -v tests/test_bh1.py`.
 
 There are 28 tests, in three groups:
 
@@ -54,4 +58,3 @@ HEXDUMP.md         one request and response, byte by byte
 www/               sample site to serve
 tests/test_bh1.py  tests
 ```
-
