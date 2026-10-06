@@ -1,7 +1,7 @@
 # Network Architecture Project: BH/1, HTTP in binary
 
 > **Calculator assignment ("Build a calculator that stays on the line"):** see the separate repo:
-> **LINK:** ______________________________
+> **LINK:** https://github.com/PurabRay/network_architecture_calculator
 
 Network Architecture course project. HTTP requests and responses travel as binary frames: a fixed 8-byte frame header, a 10-name header table, and a rule that unknown frame types are skipped.
 
