@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""
+bcurl - a tiny client that speaks BH/1 (HTTP, but in binary frames).
+
+    ./bcurl localhost:9000/index.html            body to stdout
+    ./bcurl -v localhost:9000/index.html         + hexdump of every frame
+    ./bcurl localhost:9000/a.txt /b.txt /c.txt   three requests, ONE connection
+    ./bcurl --send-unknown localhost:9000/       prove the server skips unknown frames
+
+Exit status: 0 = all OK, 1 = some response was 4xx/5xx, 2 = usage or network error.
+
+The wire format is defined in SPEC.md. This file shares NO code with bserve on
+purpose: if the two work together, it is because the spec is complete.
+
+Python 3.8+, standard library only.
+"""
+import socket
+import struct
+import sys
+
+# ---- Constants straight from SPEC.md ---------------------------------------
+PREFACE = b"BH/1"
+DATA, HEADERS = 0, 1
+END_STREAM = 0x01
+TABLE = [None, ":method", ":path", ":status", "host", "user-agent", "accept",
+         "content-type", "content-length", "server", "date"]
+
+UNKNOWN_TYPE = 0xEE         # a frame type nobody defines, for --send-unknown
+VERBOSE = False
+
+
+# ---- Hexdump (for -v) -----------------------------------------------------------
+def hexdump(data):
+    lines = []
+    for off in range(0, len(data), 16):
+        row = data[off:off + 16]
+        hexpart = " ".join(f"{b:02x}" for b in row)
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in row)
+        lines.append(f"    {off:04x}  {hexpart:<47}  |{text}|")
+    return "\n".join(lines)
+
+
+def show_frame(direction, raw):
+    """Print one frame: a decoded summary line, then the bytes."""
+    if not VERBOSE:
+        return
+    length, ftype, flags, stream = struct.unpack("!HBBI", raw[:8])
+    name = {DATA: "DATA", HEADERS: "HEADERS"}.get(ftype, f"UNKNOWN({ftype:#04x})")
+    flag_text = "END_STREAM" if flags & END_STREAM else "-"
+    print(f"{direction} {name} length={length} flags={flag_text} "
+          f"stream={stream & 0x7FFFFFFF}", file=sys.stderr)
+    print(hexdump(raw), file=sys.stderr)
+    if ftype == HEADERS:
+        for name, value in decode_headers(raw[8:]):
+            print(f"    {name}: {value}", file=sys.stderr)
+    print(file=sys.stderr)
+
+
+# ---- Frames -------------------------------------------------------------------
+def recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("server closed the connection")
+        data += chunk
+    return data
+
+
+def send_frame(sock, ftype, flags, stream, payload=b""):
+    raw = struct.pack("!HBBI", len(payload), ftype, flags, stream) + payload
+    show_frame(">", raw)
+    sock.sendall(raw)
+
+
+def read_frame(sock):
+    header = recv_exact(sock, 8)
+    length, ftype, flags, stream = struct.unpack("!HBBI", header)
+    payload = recv_exact(sock, length) if length > 0 else b""
+    show_frame("<", header + payload)
+    return ftype, flags, stream & 0x7FFFFFFF, payload
+
+
+# ---- Header blocks ------------------------------------------------------------
+def encode_headers(pairs):
+    out = b""
+    for name, value in pairs:
+        v = value.encode()
+        if name in TABLE:                            # 1 byte for the name
+            out += bytes([0x80 | TABLE.index(name)])
+        else:                                        # spell the name out
+            n = name.encode()
+            out += bytes([0, len(n)]) + n
+        out += struct.pack("!H", len(v)) + v
+    return out
+
+
+def decode_headers(block):
+    pairs, i = [], 0
+    while i < len(block):
+        first = block[i]
+        i += 1
+        if first & 0x80:
+            name = TABLE[first & 0x7F]
+        else:
+            name_len = block[i]
+            name = block[i + 1:i + 1 + name_len].decode()
+            i += 1 + name_len
+        (value_len,) = struct.unpack("!H", block[i:i + 2])
+        pairs.append((name, block[i + 2:i + 2 + value_len].decode()))
+        i += 2 + value_len
+    return pairs
+
+
+# ---- One request/response -----------------------------------------------------
+def fetch(sock, host, path, stream, send_unknown):
+    if send_unknown:
+        send_frame(sock, UNKNOWN_TYPE, 0, stream, b"from the future")
+
+    request = [(":method", "GET"), (":path", path), ("host", host),
+               ("user-agent", "bcurl/1.0"), ("accept", "*/*")]
+    send_frame(sock, HEADERS, END_STREAM, stream, encode_headers(request))
+
+    status, body = None, b""
+    while True:
+        ftype, flags, frame_stream, payload = read_frame(sock)
+        if ftype not in (DATA, HEADERS):
+            continue                        # unknown type: skip it (SPEC 5)
+        if frame_stream not in (stream, 0):
+            continue                        # not ours; v1 servers never do this
+        if ftype == HEADERS:
+            status = int(dict(decode_headers(payload))[":status"])
+        else:
+            body += payload
+        if flags & END_STREAM:
+            return status, body, frame_stream == 0
+
+
+def main():
+    global VERBOSE
+    args = sys.argv[1:]
+    send_unknown = "--send-unknown" in args
+    VERBOSE = "-v" in args
+    urls = [a for a in args if not a.startswith("-")]
+    if not urls:
+        print(__doc__, file=sys.stderr)
+        return 2
+
+    # First argument: host:port/path.  Later ones: just /path, same server.
+    first = urls[0].replace("bh://", "", 1)
+    hostport, slash, first_path = first.partition("/")
+    host, _, port = hostport.partition(":")
+    paths = ["/" + first_path] + urls[1:]
+
+    try:
+        sock = socket.create_connection((host, int(port or 9000)))
+    except (OSError, ValueError) as e:
+        print(f"bcurl: cannot connect to {hostport}: {e}", file=sys.stderr)
+        return 2
+
+    worst = 0
+    try:
+        if VERBOSE:
+            print(f"> PREFACE\n{hexdump(PREFACE)}\n", file=sys.stderr)
+        sock.sendall(PREFACE)
+        # Every request goes over this one socket. Stream ids count 1, 2, 3...
+        for stream, path in enumerate(paths, start=1):
+            status, body, fatal = fetch(sock, host, path, stream, send_unknown)
+            sys.stdout.buffer.write(body)
+            sys.stdout.flush()
+            if status >= 400:
+                worst = 1
+                print(f"bcurl: {path}: status {status}", file=sys.stderr)
+            if fatal:                       # server gave up on the connection
+                break
+    except (ConnectionError, OSError) as e:
+        print(f"bcurl: {e}", file=sys.stderr)
+        return 2
+    except (IndexError, KeyError, ValueError, TypeError, struct.error):
+        print("bcurl: the server sent something that is not valid BH/1",
+              file=sys.stderr)
+        return 2
+    finally:
+        sock.close()
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main())

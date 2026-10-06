@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""
+bserve - a tiny file server that speaks BH/1 (HTTP, but in binary frames).
+
+    ./bserve ./www 9000
+
+The wire format is defined in SPEC.md. This file shares NO code with bcurl on
+purpose: if the two work together, it is because the spec is complete.
+
+Python 3.8+, standard library only.
+"""
+import mimetypes
+import os
+import socket
+import struct
+import sys
+import threading
+from email.utils import formatdate
+from urllib.parse import unquote
+
+# ---- Constants straight from SPEC.md ---------------------------------------
+PREFACE = b"BH/1"           # the client sends these 4 bytes once, first
+DATA, HEADERS = 0, 1        # the only two frame types in version 1
+END_STREAM = 0x01           # flag: "this is the last frame of the message"
+MAX_PAYLOAD = 65535         # a 16-bit length field cannot say more
+
+# The ten header names we actually send, numbered 1..10. (Index 0 is invalid.)
+TABLE = [None, ":method", ":path", ":status", "host", "user-agent", "accept",
+         "content-type", "content-length", "server", "date"]
+
+CHUNK = 16384               # we choose to send file bodies 16 KiB per frame
+
+
+class BadRequest(Exception):
+    """Anything wrong with a request frame. The server answers 400."""
+
+
+# ---- Reading and writing frames ----------------------------------------------
+def recv_exact(sock, n):
+    """Read exactly n bytes, or return None if the peer has closed."""
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+def make_frame(ftype, flags, stream, payload=b""):
+    # 8-byte header: Length (2 bytes) | Type (1) | Flags (1) | Stream ID (4)
+    header = struct.pack("!HBBI", len(payload), ftype, flags, stream)
+    return header + payload
+
+
+def read_frame(sock):
+    """Return (type, flags, stream, payload), or None if the client left."""
+    header = recv_exact(sock, 8)
+    if header is None:
+        return None
+    length, ftype, flags, stream = struct.unpack("!HBBI", header)
+    stream = stream & 0x7FFFFFFF        # top bit is reserved: ignore it
+    payload = recv_exact(sock, length) if length > 0 else b""
+    if payload is None:
+        return None
+    return ftype, flags, stream, payload
+
+
+# ---- Header blocks (inside HEADERS frames) -----------------------------------
+def encode_headers(pairs):
+    """Every name we send is in TABLE, so each field is: 1 byte index,
+    2 byte value length, value."""
+    out = b""
+    for name, value in pairs:
+        v = value.encode()
+        out += bytes([0x80 | TABLE.index(name)]) + struct.pack("!H", len(v)) + v
+    return out
+
+
+def decode_headers(block):
+    """Turn a header block into a dict. Raises BadRequest if it is broken.
+
+    Each field starts with one byte:
+      1xxxxxxx  -> name is TABLE[xxxxxxx]
+      00000000  -> name is spelled out: 1 byte length, then the name
+    then the value: 2 byte length, then the value.
+    """
+    headers = {}
+    i = 0
+    try:
+        while i < len(block):
+            first = block[i]
+            i += 1
+            if first & 0x80:                      # indexed name
+                index = first & 0x7F
+                if index < 1 or index > 10:
+                    raise BadRequest(f"unknown header index {index}")
+                name = TABLE[index]
+            elif first == 0:                      # literal name
+                name_len = block[i]
+                name = block[i + 1:i + 1 + name_len].decode("ascii")
+                i += 1 + name_len
+            else:
+                raise BadRequest(f"bad header prefix byte {first:#04x}")
+            (value_len,) = struct.unpack("!H", block[i:i + 2])
+            value = block[i + 2:i + 2 + value_len]
+            if len(value) != value_len:
+                raise BadRequest("header value is cut short")
+            i += 2 + value_len
+            headers[name] = value.decode()
+    except (IndexError, struct.error, UnicodeDecodeError):
+        raise BadRequest("header block is cut short or not text")
+    return headers
+
+
+# ---- The HTTP part: what to answer -------------------------------------------
+def send_response(sock, stream, status, body, content_type="text/plain"):
+    headers = [(":status", str(status)),
+               ("content-type", content_type),
+               ("content-length", str(len(body))),
+               ("server", "bserve/1.0"),
+               ("date", formatdate(usegmt=True))]
+    if not body:
+        sock.sendall(make_frame(HEADERS, END_STREAM, stream,
+                                encode_headers(headers)))
+        return
+    frames = [make_frame(HEADERS, 0, stream, encode_headers(headers))]
+    for start in range(0, len(body), CHUNK):
+        piece = body[start:start + CHUNK]
+        is_last = start + CHUNK >= len(body)
+        frames.append(make_frame(DATA, END_STREAM if is_last else 0,
+                                 stream, piece))
+    sock.sendall(b"".join(frames))
+
+
+def find_file(root, path):
+    """Map '/docs/a.txt' to a real file under root. None means 404."""
+    path = unquote(path.split("?")[0])
+    if path.endswith("/"):
+        path += "index.html"
+    full = os.path.realpath(os.path.join(root, path.lstrip("/")))
+    if not full.startswith(root + os.sep):      # blocks ../../etc/passwd
+        return None
+    return full if os.path.isfile(full) else None
+
+
+def answer(sock, root, stream, headers):
+    """Given a decoded request, send the response. Returns the status."""
+    if ":method" not in headers or ":path" not in headers:
+        raise BadRequest("request needs :method and :path")
+    if not headers[":path"].startswith("/"):
+        raise BadRequest(":path must start with /")
+    if headers[":method"] != "GET":
+        send_response(sock, stream, 405, b"405 only GET is supported\n")
+        return 405
+    filename = find_file(root, headers[":path"])
+    if filename is None:
+        send_response(sock, stream, 404, b"404 not found\n")
+        return 404
+    with open(filename, "rb") as f:
+        body = f.read()
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    send_response(sock, stream, 200, body, content_type)
+    return 200
+
+
+# ---- One connection ------------------------------------------------------------
+def serve_connection(sock, addr, root):
+    who = f"{addr[0]}:{addr[1]}"
+    log = lambda msg: print(f"{who}  {msg}", file=sys.stderr, flush=True)
+    try:
+        # 1. The preface. If it is wrong we cannot trust any byte after it,
+        #    so we answer 400 on stream 0 and hang up.
+        if recv_exact(sock, 4) != PREFACE:
+            send_response(sock, 0, 400, b"400 bad preface, expected BH/1\n")
+            log("bad preface -> 400, closing")
+            # Close politely: say "no more from me" (FIN), then throw away
+            # whatever the client already sent. Closing with unread bytes
+            # makes TCP send a reset, which can destroy our 400 in transit.
+            try:
+                sock.shutdown(socket.SHUT_WR)
+                sock.settimeout(1)
+                while sock.recv(4096):
+                    pass
+            except OSError:
+                pass                    # client already gone: nothing to do
+            return
+
+        # 2. Frames, one after another, until the client closes.
+        while True:
+            frame = read_frame(sock)
+            if frame is None:
+                break
+            ftype, flags, stream, payload = frame
+
+            if ftype not in (DATA, HEADERS):
+                # THE RULE: unknown frame type -> skip it. We already read
+                # its payload (the length told us how much), so just move on.
+                log(f"skipped unknown frame type {ftype:#04x}")
+                continue
+
+            try:
+                if ftype == DATA:
+                    raise BadRequest("clients do not send DATA in BH/1")
+                if stream == 0:
+                    raise BadRequest("requests must use a stream id > 0")
+                if not flags & END_STREAM:
+                    raise BadRequest("a request is one HEADERS frame "
+                                     "with END_STREAM set")
+                headers = decode_headers(payload)
+                status = answer(sock, root, stream, headers)
+                log(f"{headers[':method']} {headers[':path']} -> {status}")
+            except BadRequest as e:
+                # The frame itself was well-formed (we know where it ended),
+                # so we answer 400 and KEEP the connection open.
+                send_response(sock, stream, 400, f"400 {e}\n".encode())
+                log(f"400: {e}")
+    except OSError as e:
+        log(f"connection error: {e}")
+    finally:
+        sock.close()
+        log("closed")
+
+
+def main():
+    if len(sys.argv) != 3:
+        print("usage: bserve ROOT PORT", file=sys.stderr)
+        sys.exit(2)
+    root = os.path.realpath(sys.argv[1])
+    port = int(sys.argv[2])
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", port))
+    server.listen()
+    print(f"bserve: serving {root} on port {port}", file=sys.stderr, flush=True)
+
+    while True:
+        sock, addr = server.accept()
+        # One thread per connection, so two clients can be served at once.
+        threading.Thread(target=serve_connection, args=(sock, addr, root),
+                         daemon=True).start()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
